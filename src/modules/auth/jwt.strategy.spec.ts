@@ -11,7 +11,7 @@ describe('JwtStrategy session validation', () => {
   const prismaMock = {
     authSession: {
       findFirst: jest.fn(
-        async ({
+        ({
           where,
         }: {
           where: { sessionId: string; userId: string };

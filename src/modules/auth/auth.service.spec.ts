@@ -225,7 +225,7 @@ describe('AuthService', () => {
         data: expect.objectContaining({
           userId: provisionedUser.userId,
           expiresAt: expect.any(Date) as Date,
-        }),
+        }) as { userId: string; expiresAt: Date },
       });
       expect(prismaMock.authChallenge.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -393,7 +393,7 @@ describe('AuthService', () => {
           sessionId: expect.any(String) as string,
           userId: 'user-1',
           expiresAt: expect.any(Date) as Date,
-        }),
+        }) as { sessionId: string; userId: string; expiresAt: Date },
       });
     });
   });
