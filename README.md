@@ -18,6 +18,8 @@ LocalSettle is a peer-to-peer marketplace that connects local payment methods wi
 
 `POST /auth/challenge` creates a short-lived random challenge for a public key. The connected wallet signs it locally. `POST /auth/login` verifies the signature, consumes the challenge once, and returns a session token. The API verifies public-key ownership; it does not need the user's secret key for this flow.
 
+The login token is temporary and can be used to validate an alias and complete `POST /users/:id/setup`. That bootstrap route remains available before setup is complete. The setup response returns a final token with the `setupComplete: true` claim; profile, payment, trading, chat, and wallet routes that declare `SetupCompleteGuard` require that final token.
+
 Challenge issuance is limited independently by client IP and wallet (defaults: 10 requests per 60 seconds). Failed signature verification is limited independently by IP and wallet (defaults: 5 failures per 60 seconds). Configure these windows with `AUTH_CHALLENGE_RATE_LIMIT_MAX`, `AUTH_CHALLENGE_RATE_LIMIT_TTL_MS`, `AUTH_FAILED_SIGNATURE_RATE_LIMIT_MAX`, and `AUTH_FAILED_SIGNATURE_RATE_LIMIT_TTL_MS`. A legitimate user who reaches a limit should wait for that window to expire before requesting a new challenge or retrying a signature. Authentication audit events record only the operation and limit scope; wallet identifiers in those events are hashed.
 
 ### Direct USDC payment
