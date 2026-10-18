@@ -9,6 +9,7 @@ import { EscrowService } from '../escrow/escrow.service';
 import { AppException, ErrorCode } from '../../common/errors';
 import {
   Order,
+  Prisma,
   order_status,
   escrow_status,
   EscrowOnChain,
@@ -17,7 +18,8 @@ import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
 import { CreateAuditLogInput } from '../audit-log/interfaces/create-audit-log.interface';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { ORDER_STATUS } from './order.constants';
+import { ORDER_STATUS, PATCHABLE_ORDER_TRANSITIONS } from './order.constants';
+import { AppRole } from '../../common/interfaces/app-role.interface';
 import {
   ORDER_PARTY_CONTACT_SELECT,
   OrderPartyContact,
@@ -185,10 +187,73 @@ export class OrderService {
   }
 
   async update(id: string, dto: UpdateOrderDto): Promise<Order> {
+    let currentOrder: OrderWithRelations | null = null;
+    let expectedEscrowStatus: escrow_status | undefined;
+    if (dto.orderStatus !== undefined) {
+      currentOrder = await this.repo.findById(id);
+      if (!currentOrder) {
+        throw new AppException(
+          ErrorCode.ORDER_NOT_FOUND,
+          `Order ${id} not found`,
+        );
+      }
+
+      const allowedNextStatuses =
+        PATCHABLE_ORDER_TRANSITIONS[currentOrder.orderStatus] ?? [];
+      if (
+        dto.orderStatus !== currentOrder.orderStatus &&
+        !allowedNextStatuses.includes(dto.orderStatus)
+      ) {
+        throw new AppException(
+          ErrorCode.ORDER_INVALID_TRANSITION,
+          `Order cannot transition from "${currentOrder.orderStatus}" to "${dto.orderStatus}" through PATCH; use the dedicated cancellation or escrow flow`,
+        );
+      }
+
+      const requiredEscrowByOrderStatus: Partial<
+        Record<order_status, escrow_status>
+      > = {
+        locked: 'funded',
+        released: 'released',
+        disputed: 'disputed',
+      };
+      expectedEscrowStatus =
+        requiredEscrowByOrderStatus[dto.orderStatus];
+      if (
+        dto.orderStatus !== currentOrder.orderStatus &&
+        (!currentOrder.escrow ||
+          currentOrder.escrow.escrowStatus !== expectedEscrowStatus)
+      ) {
+        throw new AppException(
+          ErrorCode.ORDER_INVALID_TRANSITION,
+          `Order cannot transition to "${dto.orderStatus}" unless its escrow is "${expectedEscrowStatus}"`,
+        );
+      }
+    }
+
     const data: Record<string, unknown> = { ...dto };
     delete data.orderStatus;
     if (dto.expiresAt) data.expiresAt = new Date(dto.expiresAt);
-    const updated = (await this.repo.update(id, data)) as Order;
+    let updated: Order;
+    if (currentOrder && dto.orderStatus !== undefined) {
+      const applied = await this.repo.updateIfStatusesMatch(
+        id,
+        currentOrder.orderStatus,
+        dto.orderStatus === currentOrder.orderStatus
+          ? undefined
+          : expectedEscrowStatus,
+        { ...data, orderStatus: dto.orderStatus } as Prisma.OrderUpdateManyMutationInput,
+      );
+      if (!applied) {
+        throw new AppException(
+          ErrorCode.ORDER_INVALID_TRANSITION,
+          'Order or escrow status changed while applying the requested transition; reload the order and retry',
+        );
+      }
+      updated = (await this.repo.findById(id)) as Order;
+    } else {
+      updated = (await this.repo.update(id, data)) as Order;
+    }
 
     // Record cancellation/expiration explicitly when the update sets the
     // order into one of those terminal statuses; other field updates
@@ -303,7 +368,21 @@ export class OrderService {
     return this.repo.cancelAndReleaseReservation(id);
   }
 
-  getUserStats(userId: string): Promise<UserStats> {
+  async getUserStats(userId: string, requesterId: string): Promise<UserStats> {
+    // Account-level order metrics are private. Owners can view their own
+    // counts; only administrators may inspect another account's counts.
+    if (userId !== requesterId) {
+      const requester = await this.prisma.appUser.findUnique({
+        where: { userId: requesterId },
+        select: { role: true },
+      });
+      if (!requester || requester.role !== AppRole.admin) {
+        throw new AppException(
+          ErrorCode.UNAUTHORIZED_ACTION,
+          'Only the account owner or an administrator can view these order statistics',
+        );
+      }
+    }
     return this.repo.getUserStats(userId);
   }
 

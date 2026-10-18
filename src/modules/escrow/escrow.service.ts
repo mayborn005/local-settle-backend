@@ -47,6 +47,13 @@ import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
 import { createEvidenceObjectKey } from '../file-storage/evidence-object-key.util';
 import { createHash } from 'crypto';
 
+export interface EscrowAuditContext {
+  userId?: string;
+  ipAddress?: string;
+  userAgent?: string;
+  correlationId?: string;
+}
+
 @Injectable()
 export class EscrowService {
   private readonly logger = new Logger(EscrowService.name);
@@ -224,6 +231,7 @@ export class EscrowService {
       deployResult.unsignedTransaction,
       deployerSecret,
       this.getNetworkPassphrase(),
+      'deploy',
     );
 
     if (broadcastResult.status !== 'SUCCESS' || !broadcastResult.contractId) {
@@ -626,6 +634,8 @@ export class EscrowService {
         approveXdr.unsignedTransaction,
         treasurySecret,
         this.getNetworkPassphrase(),
+        'approve',
+        escrow.contractId,
       );
 
       if (broadcastResult.status !== 'SUCCESS') {
@@ -648,7 +658,10 @@ export class EscrowService {
     };
   }
 
-  async syncTransaction(dto: SyncEscrowDto) {
+  async syncTransaction(
+    dto: SyncEscrowDto,
+    auditContext: EscrowAuditContext = {},
+  ) {
     const escrow = await this.getOrFail(dto.escrowId);
     const transactionHash = createHash('sha256')
       .update(dto.signedXdr)
@@ -669,65 +682,90 @@ export class EscrowService {
       };
     }
 
-    this.validateStatusTransition(escrow.escrowStatus, dto.action);
+    try {
+      this.validateStatusTransition(escrow.escrowStatus, dto.action);
 
-    const result = await this.tw.sendTransaction(dto.signedXdr);
-    if (result.status !== 'SUCCESS') {
-      throw new AppException(
-        ErrorCode.ESCROW_SYNC_FAILED,
-        `Blockchain sync failed: ${result.message || 'Unknown error'}`,
-      );
-    }
+      const result = await this.tw.sendTransaction(dto.signedXdr);
+      if (result.status !== 'SUCCESS') {
+        throw new AppException(
+          ErrorCode.ESCROW_SYNC_FAILED,
+          `Blockchain sync failed: ${result.message || 'Unknown error'}`,
+        );
+      }
 
-    const updateData: Record<string, unknown> = {};
-    updateData.lastSyncTxHash = transactionHash;
-    updateData.lastSyncAction = dto.action;
-    switch (dto.action) {
-      case EscrowAction.INITIALIZE:
-        updateData.escrowStatus = 'initialized';
-        if (result.contractId) updateData.contractId = result.contractId;
-        updateData.txHashLock = dto.signedXdr.substring(0, 64);
-        break;
-      case EscrowAction.FUND:
-        updateData.escrowStatus = 'funded';
-        break;
-      case EscrowAction.FIAT_SENT:
-        updateData.escrowStatus = 'fiat_sent';
-        break;
-      case EscrowAction.RELEASE:
-        updateData.escrowStatus = 'released';
-        updateData.txHashRelease = dto.signedXdr.substring(0, 64);
-        break;
-    }
-    await this.repo.update(dto.escrowId, updateData);
+      const updateData: Record<string, unknown> = {};
+      updateData.lastSyncTxHash = transactionHash;
+      updateData.lastSyncAction = dto.action;
+      switch (dto.action) {
+        case EscrowAction.INITIALIZE:
+          updateData.escrowStatus = 'initialized';
+          if (result.contractId) updateData.contractId = result.contractId;
+          updateData.txHashLock = dto.signedXdr.substring(0, 64);
+          break;
+        case EscrowAction.FUND:
+          updateData.escrowStatus = 'funded';
+          break;
+        case EscrowAction.FIAT_SENT:
+          updateData.escrowStatus = 'fiat_sent';
+          break;
+        case EscrowAction.RELEASE:
+          updateData.escrowStatus = 'released';
+          updateData.txHashRelease = dto.signedXdr.substring(0, 64);
+          break;
+      }
+      await this.repo.update(dto.escrowId, updateData);
 
-    if (dto.action === EscrowAction.FUND) {
       await this.auditLogService.create({
-        action: AuditAction.ESCROW_FUNDED,
-        resourceType: 'Escrow',
-        resourceId: dto.escrowId,
-        result: AuditResult.SUCCESS,
-        metadata: { contractId: result.contractId ?? escrow.contractId },
-      });
-    } else if (dto.action === EscrowAction.RELEASE) {
-      await this.auditLogService.create({
-        action: AuditAction.ESCROW_RELEASED,
+        ...auditContext,
+        action: this.auditActionForEscrowAction(dto.action),
         resourceType: 'Escrow',
         resourceId: dto.escrowId,
         result: AuditResult.SUCCESS,
         metadata: {
+          action: dto.action,
+          orderId: escrow.orderId,
           contractId: result.contractId ?? escrow.contractId,
-          txHashRelease: updateData.txHashRelease,
+          transactionHash,
         },
       });
-    }
 
-    return {
-      escrowId: dto.escrowId,
-      status: result.status,
-      contractId: result.contractId ?? escrow.contractId,
-      newEscrowStatus: updateData.escrowStatus,
-    };
+      return {
+        escrowId: dto.escrowId,
+        status: result.status,
+        contractId: result.contractId ?? escrow.contractId,
+        newEscrowStatus: updateData.escrowStatus,
+      };
+    } catch (error) {
+      await this.auditLogService.create({
+        ...auditContext,
+        action: this.auditActionForEscrowAction(dto.action),
+        resourceType: 'Escrow',
+        resourceId: dto.escrowId,
+        result: AuditResult.FAILURE,
+        metadata: {
+          action: dto.action,
+          orderId: escrow.orderId,
+          contractId: escrow.contractId,
+          transactionHash,
+        },
+      });
+      throw error;
+    }
+  }
+
+  private auditActionForEscrowAction(action: EscrowAction): AuditAction {
+    switch (action) {
+      case EscrowAction.INITIALIZE:
+        return AuditAction.ESCROW_CREATED;
+      case EscrowAction.FUND:
+        return AuditAction.ESCROW_FUNDED;
+      case EscrowAction.FIAT_SENT:
+        return AuditAction.ESCROW_FIAT_SENT;
+      case EscrowAction.RELEASE:
+        return AuditAction.ESCROW_RELEASED;
+      default:
+        return AuditAction.ESCROW_CREATED;
+    }
   }
 
   async getStatus(id: string) {
